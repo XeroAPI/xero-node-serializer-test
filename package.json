@@ -1,5 +1,5 @@
 {
-  "name": "xero-node-oauth2-task-1",
+  "name": "xero-node-serializer-test",
   "version": "1.0.0",
   "scripts": {
     "start": "nodemon index.js"
@@ -9,7 +9,8 @@
     "dotenv": "^8.2.0",
     "express": "^4.17.1",
     "express-session": "^1.17.0",
+    "jwt-decode": "^3.1.2",
     "nodemon": "^2.0.1",
-    "xero-node": "^4.0.2"
+    "xero-node": "^4.15.0"
   }
 }

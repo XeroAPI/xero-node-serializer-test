@@ -4,6 +4,7 @@ require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
 const bodyParser = require('body-parser');
+const jwtDecode = require('jwt-decode');
 const xero_node = require('xero-node');
 
 const client_id = process.env.CLIENT_ID;
@@ -33,159 +34,119 @@ const xero = new xero_node.XeroClient({
     cookie: { secure: false }
   }));
 
-  app.get('/', async (req, res) => {
-    let consentUrl = await xero.buildConsentUrl();
+  const authenticationData = (req, res) => {
+    return {
+      decodedIdToken: req.session.decodedIdToken,
+      decodedAccessToken: req.session.decodedAccessToken,
+      tokenSet: req.session.tokenSet,
+      allTenants: req.session.allTenants,
+      activeTenant: req.session.activeTenant,
+    };
+  };
 
-    res.send(`Sign in and connect with Xero using OAuth2! <br><a href="${consentUrl}">Connect to Xero</a>`);
+  app.get('/', (req, res) => {
+    res.send(`<a href='/connect'>Connect to Xero</a>`);
+  });
+
+  app.get('/connect', async (req, res) => {
+    try {
+      const consentUrl = await xero.buildConsentUrl();
+      res.redirect(consentUrl);
+    } catch (err) {
+      res.send('Sorry, something went wrong');
+    }
   });
 
   app.get('/callback', async (req, res) => {
     try {
-      const url = 'http://localhost:5000/' + req.originalUrl;
-      await xero.setAccessTokenFromRedirectUri(url);
-
-      const token = await xero.readTokenSet();
-
-      req.session.token = token;
-      req.session.accessToken = token.access_token;
-      req.session.idToken = token.id_token;
-      req.session.allTenants = xero.tenantIds;
-      req.session.activeTenant = xero.tenantIds[0];
-    } catch (e) {
-      console.log(e);
-      res.json(e);
-    } finally {
-      res.redirect('/task-prompt');
+      const tokenSet = await xero.apiCallback(req.url);
+      await xero.updateTenants();
+  
+      const decodedIdToken = jwtDecode(tokenSet.id_token);
+      const decodedAccessToken = jwtDecode(tokenSet.access_token);
+  
+      req.session.decodedIdToken = decodedIdToken;
+      req.session.decodedAccessToken = decodedAccessToken;
+      req.session.tokenSet = tokenSet;
+      req.session.allTenants = xero.tenants;
+      // XeroClient is sorting tenants behind the scenes so that most recent / active connection is at index 0
+      req.session.activeTenant = xero.tenants[0];
+  
+      const authData = authenticationData(req, res);
+  
+      console.log(authData);
+  
+      res.redirect('/organisation');
+    } catch (err) {
+      res.send('Sorry, something went wrong');
     }
   });
 
-  app.get('/task-prompt', (req, res) => {
-    res.send(`
-      <h1>Task 1: Create an invoice</h1>
-      <ol>
-        <li>Create an item call 'Surfboard' with a sale price of $520.99</li>
-        <li>Create an item call 'Skateboard' with a sale price of $124.30</li>
-        <li>Create a sales invoice for 4 Surfboards and 5 Skateboards, selling them to a new contact, Rod Drury</li>
-        <li>Record a payment for the full amount against the invoice</li>
-        <li>Note the InvoiceID of the invoice</li>
-      </ol>
-      <button><a href='/execute'>EXECUTE?</a></button>
-    `);
+  app.get('/organisation', async (req, res) => {
+    try {
+      const tokenSet = await xero.readTokenSet();
+      console.log(tokenSet.expired() ? 'expired' : 'valid');
+      const response = await xero.accountingApi.getOrganisations(req.session.activeTenant.tenantId);
+      res.send(`Hello, ${response.body.organisations[0].name}`);
+    } catch (err) {
+      res.send('Sorry, something went wrong');
+    }
   });
 
-  app.get('/execute', async (req, res) => {
+  app.get('/invoice', async (req, res) => {
     try {
-      const token = req.session.token;
-      await xero.setTokenSet(token);
-
-      const surfboardItem = {
-        code: 'surfboard-001',
-        name: 'Surfboard',
-        description: 'purchase surfboard',
-        purchaseDescription: 'purchase surfboard',
-        purchaseDetails: {
-          unitPrice: 375.5000,
-          taxType: 'NONE',
-          accountCode: '500',
-        },
-        salesDetails: {
-          unitPrice: 520.9900,
-          taxType: 'NONE',
-          accountCode: '400',
-        }
+      const contacts = await xero.accountingApi.getContacts(req.session.activeTenant.tenantId);
+      console.log('contacts: ', contacts.body.contacts);
+      const where = 'Status=="ACTIVE" AND Type=="SALES"';
+      const accounts = await xero.accountingApi.getAccounts(req.session.activeTenant.tenantId, null, where);
+      console.log('accounts: ', accounts.body.accounts);
+      const contact = {
+        contactID: contacts.body.contacts[0].contactID
       };
-
-      const skateboardItem = {
-        code: 'skateboard-002',
-        name: 'Skateboard',
-        description: 'purchase skateboard',
-        purchaseDescription: 'purchase skateboard',
-        purchaseDetails: {
-          unitPrice: 75.0000,
-          taxType: 'NONE',
-          accountCode: '500',
-        },
-        salesDetails: {
-          unitPrice: 124.3000,
-          taxType: 'NONE',
-          accountCode: '400',
-        }
+      const lineItem = {
+        accountCode: accounts.body.accounts[0].accountID,
+        description: 'consulting',
+        quantity: 1.0,
+        unitAmount: 10.0
       };
-
-      const newContact = {
-        name: 'Boards by Land and by Sea',
-        firstName: 'Rod',
-        lastName: 'Drury',
-        emailAddress: 'rod.drury@bls.com',
-        accountNumber: '555555555'
-      };
-
-      const createSurfboardResponse = await xero.accountingApi.createItem(req.session.activeTenant, surfboardItem);
-      console.log(JSON.stringify(createSurfboardResponse.body));
-
-      const createSkateboardResponse = await xero.accountingApi.createItem(req.session.activeTenant, skateboardItem);
-      console.log(JSON.stringify(createSkateboardResponse.body));
-
-      const createContactResponse = await xero.accountingApi.createContact(req.session.activeTenant, newContact);
-      console.log(JSON.stringify(createContactResponse.body));
-
       const invoice = {
-        type: 'ACCREC',
-        contact: {
-          contactID: createContactResponse.body.contacts[0].contactID,
-          name: createContactResponse.body.contacts[0].name
-        },
-        currencyCode: 'USD',
-        dueDate: '\/Date(1518685950940+0000)\/',
-        lineItems: [
+        lineItems: [lineItem],
+        contact: contact,
+        dueDate: '2021-09-25',
+        date: '2021-09-24',
+        type: 'ACCREC'
+      };
+      const invoices = {
+        invoices: [invoice]
+      };
+      const response = await xero.accountingApi.createInvoices(req.session.activeTenant.tenantId, invoices);
+      console.log('invoices: ', response.body.invoices);
+      res.json(response.body.invoices);
+    } catch (err) {
+      res.json(err);
+    }
+  });
+  
+  app.get('/contact', async (req, res) => {
+    try {
+      const contact = {
+        name: "Bruce Banner",
+        emailAddress: "hulk@avengers.com",
+        phones: [
           {
-            itemCode: createSurfboardResponse.body.items[0].code,
-            quantity: 4.0000,
-            unitAmount: createSurfboardResponse.body.items[0].salesDetails.unitPrice,
-            taxType: createSurfboardResponse.body.items[0].salesDetails.taxType,
-            accountCode: createSurfboardResponse.body.items[0].salesDetails.uniaccountCodetPrice,
-          },
-          {
-            itemCode: createSkateboardResponse.body.items[0].code,
-            quantity: 5.0000,
-            unitAmount: createSkateboardResponse.body.items[0].salesDetails.unitPrice,
-            taxType: createSkateboardResponse.body.items[0].salesDetails.taxType,
-            accountCode: createSkateboardResponse.body.items[0].salesDetails.accountCode,
+            phoneNumber:'555-555-5555',
+            phoneType: 'MOBILE'
           }
-        ],
-        status: 'AUTHORISED'
+        ]
       };
-
-      const createInvoiceResponse = await xero.accountingApi.createInvoice(req.session.activeTenant, invoice);
-      console.log(JSON.stringify(createInvoiceResponse.body));
-
-      const account = {
-        code: '555555555',
-        name: 'Boards by Land and by Sea - Bank Account x8',
-        type: 'BANK',
-        bankAccountNumber: '555555555'
-      };
-
-      const payment = {
-        account: {
-          code: account.code
-        },
-        invoice: {
-          invoiceID: createInvoiceResponse.body.invoices[0].invoiceID
-        },
-        amount: createInvoiceResponse.body.invoices[0].total
-      };
-
-      const createAccountResponse = await xero.accountingApi.createAccount(req.session.activeTenant, account);
-      console.log(JSON.stringify(createAccountResponse.body));
-
-      const createPaymentResponse = await xero.accountingApi.createPayment(req.session.activeTenant, payment);
-      console.log(JSON.stringify(createPaymentResponse.body));
-
-      res.json([createSurfboardResponse.body, createSkateboardResponse.body, createContactResponse.body, createInvoiceResponse.body, createPaymentResponse.body]);
-    } catch (e) {
-      console.log(e);
-      res.json(e);
+      const contacts = {  
+        contacts: [contact]
+      }; 
+      const response = await xero.accountingApi.createContacts(req.session.activeTenant.tenantId, contacts);
+      console.log('contacts: ', response.body.contacts);
+      res.json(response.body.contacts);
+    } catch (err) {
+      res.json(err);
     }
   });
 
